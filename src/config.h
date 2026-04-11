@@ -11,6 +11,7 @@ constexpr int ELECTION_TIMEOUT_MIN_MS = 300;
 constexpr int ELECTION_TIMEOUT_MAX_MS = 600;
 constexpr int HEARTBEAT_INTERVAL_MS = 100;
 constexpr int SOCKET_TIMEOUT_MS = 500;
+constexpr int SNAPSHOT_LOG_THRESHOLD = 50;
 
 // node config struct
 struct NodeConfig {

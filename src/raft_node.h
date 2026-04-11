@@ -50,6 +50,10 @@ class RaftNode {
     std::vector<LogEntry> log;
     StateMachine kvStore;
 
+    // snapshot state (persistent)
+    int lastIncludedIndex = 0;
+    int lastIncludedTerm  = 0;
+
     // volatile state for all servers
     int commitIndex = 0;
     int lastApplied = 0;
@@ -103,6 +107,26 @@ class RaftNode {
     int lastLogTerm() const;
     bool isLogUpToDate(int candidateLastIndex, int candidateLastTerm) const;
     void log_event(const std::string& event) const;
+
+    // log access helper (accounts for snapshot offset)
+    const LogEntry& logAt(int logicalIndex) const;
+
+    // persistent state (currentTerm, votedFor, log[])
+    void savePersistentState() const;
+    void appendLogEntryToDisk(const LogEntry& e) const;
+    bool loadPersistentState();
+
+    // snapshot management
+    void takeSnapshot();
+    void saveSnapshotToFile() const;
+    bool loadSnapshotFromFile();
+    std::string serializeKVStore() const;
+    void deserializeKVStore(const std::string& data);
+
+    // snapshot RPC handlers
+    Message handleInstallSnapshot(const Message& msg);
+    Message handleInstallSnapshotReply(const Message& msg);
+    void    sendInstallSnapshotToPeer(int peerId);
 
 public:
     // constructor

@@ -26,9 +26,15 @@ test_advanced: $(TESTDIR)/test_advanced.cpp $(SRCDIR)/network.cpp
 test_edge: $(TESTDIR)/test_edge_cases.cpp $(SRCDIR)/network.cpp
 	$(CXX) $(CXXFLAGS) -o $@ $^
 
-tests: test_unit test_integration test_advanced test_edge
+test_snapshot: $(TESTDIR)/test_snapshot.cpp $(SRCDIR)/network.cpp
+	$(CXX) $(CXXFLAGS) -o $@ $^
+
+test_stress: $(TESTDIR)/test_stress.cpp $(SRCDIR)/network.cpp
+	$(CXX) $(CXXFLAGS) -o $@ $^
+
+tests: raft_node test_unit test_integration test_advanced test_edge test_snapshot test_stress
 
 clean:
-	rm -f raft_node raft_client test_unit test_integration test_advanced test_edge test_node_*.log node_*.log
+	rm -f raft_node raft_client test_unit test_integration test_advanced test_edge test_snapshot test_stress test_node_*.log node_*.log snapshot_*.dat raft_state_*.dat
 
 .PHONY: all tests clean

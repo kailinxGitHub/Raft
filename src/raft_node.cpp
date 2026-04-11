@@ -1,5 +1,6 @@
 #include "raft_node.h"
 #include <iostream>
+#include <fstream>
 #include <thread>
 #include <chrono>
 #include <algorithm>
@@ -50,9 +51,14 @@ void RaftNode::log_event(const std::string& event) const {
               << event << std::endl;
 }
 
-// get last log index
+// get last log index (accounts for snapshot offset)
 int RaftNode::lastLogIndex() const {
-    return static_cast<int>(log.size()) - 1;
+    return lastIncludedIndex + static_cast<int>(log.size()) - 1;
+}
+
+// log access helper: returns entry at logical index i
+const LogEntry& RaftNode::logAt(int logicalIndex) const {
+    return log[logicalIndex - lastIncludedIndex];
 }
 
 // get last log term
@@ -76,6 +82,7 @@ void RaftNode::becomeFollower(int term) {
     if (term > currentTerm) {
         currentTerm = term;
         votedFor = -1;
+        savePersistentState();
     }
 
     // stop heartbeat and election timers
@@ -93,6 +100,10 @@ void RaftNode::startElection() {
     votedFor = nodeId;
     votesReceived = 1;
     electionTerm = currentTerm;
+    // Note: we do NOT persist here. A self-vote in a failed candidacy must not
+    // survive a crash — doing so causes stale high-term disruption on restart.
+    // We persist when granting a vote to someone else (handleRequestVote) or
+    // when our term advances due to a higher-term message (becomeFollower).
     electionTimer.reset();
 
     log_event("Starting election for term " + std::to_string(currentTerm));
@@ -168,46 +179,56 @@ void RaftNode::sendHeartbeats() {
     }
 }
 
-// send append entries to a peer
+// send append entries to a peer (or InstallSnapshot if log is compacted past peer)
 void RaftNode::sendAppendEntriesToPeer(int peerId) {
     if (role != Role::Leader) return;
 
     int ni = nextIndex[peerId];
-    int prevIdx = ni - 1;
-    int prevTrm = (prevIdx >= 0 && prevIdx < static_cast<int>(log.size()))
-                  ? log[prevIdx].term : 0;
 
-    // get entries to send
-    std::vector<LogEntry> entriesToSend;
-    for (int i = ni; i < static_cast<int>(log.size()); i++) {
-        entriesToSend.push_back(log[i]);
+    // If the entry the follower needs is before our snapshot, send snapshot instead
+    if (ni - 1 < lastIncludedIndex) {
+        sendInstallSnapshotToPeer(peerId);
+        return;
     }
 
-    // get current term and leader id
-    int term = currentTerm;
-    int lid = nodeId;
-    int lc = commitIndex;
-    int lastIdx = static_cast<int>(log.size()) - 1;
+    int prevIdx = ni - 1;
+    int prevTrm;
+    if (prevIdx == lastIncludedIndex) {
+        prevTrm = lastIncludedTerm;
+    } else if (prevIdx > lastIncludedIndex &&
+               (prevIdx - lastIncludedIndex) < static_cast<int>(log.size())) {
+        prevTrm = log[prevIdx - lastIncludedIndex].term;
+    } else {
+        prevTrm = 0;
+    }
+
+    std::vector<LogEntry> entriesToSend;
+    for (int i = ni; i <= lastLogIndex(); i++) {
+        entriesToSend.push_back(logAt(i));
+    }
+
+    int term    = currentTerm;
+    int lid     = nodeId;
+    int lc      = commitIndex;
+    int lastIdx = lastLogIndex();
     const auto& peerConfig = config.getNode(peerId);
 
-    // send append entries to the peer
     std::thread([this, peerConfig, term, lid, prevIdx, prevTrm, lc,
                  entriesToSend, peerId, lastIdx]() {
         Message req;
-        req.type = MessageType::AppendEntries;
-        req.term = term;
-        req.senderId = lid;
-        req.leaderId = lid;
+        req.type         = MessageType::AppendEntries;
+        req.term         = term;
+        req.senderId     = lid;
+        req.leaderId     = lid;
         req.prevLogIndex = prevIdx;
-        req.prevLogTerm = prevTrm;
+        req.prevLogTerm  = prevTrm;
         req.leaderCommit = lc;
-        req.entries = entriesToSend;
+        req.entries      = entriesToSend;
 
         Message reply;
         if (sendRPC(peerConfig.hostname, peerConfig.port, req, reply)) {
             reply.senderId = peerId;
-            Event e{Event::IncomingRPC, reply, peerId, lastIdx};
-            eventQueue.push(e);
+            eventQueue.push(Event{Event::IncomingRPC, reply, peerId, lastIdx});
         }
     }).detach();
 }
@@ -236,6 +257,7 @@ Message RaftNode::handleRequestVote(const Message& msg) {
 
     if (canVote && logOk) {
         votedFor = msg.candidateId;
+        savePersistentState();
         reply.voteGranted = true;
         electionTimer.reset();
         log_event("Voted for Node " + std::to_string(msg.candidateId));
@@ -298,13 +320,17 @@ Message RaftNode::handleAppendEntries(const Message& msg) {
 
     // check prevLog match
     if (msg.prevLogIndex > 0) {
-        if (msg.prevLogIndex >= static_cast<int>(log.size())) {
+        int prevPos = msg.prevLogIndex - lastIncludedIndex;
+        if (msg.prevLogIndex > lastIncludedIndex &&
+            prevPos >= static_cast<int>(log.size())) {
             log_event("AppendEntries log mismatch: prevLogIndex "
-                      + std::to_string(msg.prevLogIndex) + " > log size "
-                      + std::to_string(log.size()));
+                      + std::to_string(msg.prevLogIndex) + " beyond log");
             return reply;
         }
-        if (log[msg.prevLogIndex].term != msg.prevLogTerm) {
+        int prevTrm = (msg.prevLogIndex == lastIncludedIndex)
+                      ? lastIncludedTerm
+                      : log[prevPos].term;
+        if (prevTrm != msg.prevLogTerm) {
             log_event("AppendEntries term mismatch at index "
                       + std::to_string(msg.prevLogIndex));
             return reply;
@@ -312,21 +338,40 @@ Message RaftNode::handleAppendEntries(const Message& msg) {
     }
 
     // delete conflicting entries and append new ones
-    int insertIdx = msg.prevLogIndex + 1;
+    int insertLogicalIdx = msg.prevLogIndex + 1;
+    bool truncated = false;
+    std::vector<LogEntry> newEntries;  // entries that were genuinely appended
     for (size_t i = 0; i < msg.entries.size(); i++) {
-        int logIdx = insertIdx + static_cast<int>(i);
-        if (logIdx < static_cast<int>(log.size())) {
-            if (log[logIdx].term != msg.entries[i].term) {
-                log.resize(logIdx);
+        int logicalIdx = insertLogicalIdx + static_cast<int>(i);
+        int arrPos = logicalIdx - lastIncludedIndex;
+        if (arrPos < static_cast<int>(log.size())) {
+            if (log[arrPos].term != msg.entries[i].term) {
+                log.resize(arrPos);
                 log.push_back(msg.entries[i]);
+                truncated = true;
+                newEntries.push_back(msg.entries[i]);
             }
+            // matching entry already present — no action needed
         } else {
             log.push_back(msg.entries[i]);
+            newEntries.push_back(msg.entries[i]);
+        }
+    }
+
+    if (!msg.entries.empty()) {
+        if (truncated) {
+            // full rewrite needed because we deleted entries
+            savePersistentState();
+        } else {
+            // pure appends — O(1) incremental write per new entry
+            for (const auto& e : newEntries) {
+                appendLogEntryToDisk(e);
+            }
         }
     }
 
     if (msg.leaderCommit > commitIndex) {
-        commitIndex = std::min(msg.leaderCommit, static_cast<int>(log.size()) - 1);
+        commitIndex = std::min(msg.leaderCommit, lastLogIndex());
     }
 
     reply.success = true;
@@ -378,8 +423,8 @@ Message RaftNode::handleAppendEntriesReply(const Message& msg, int lastSentIndex
 
 // advance commit index
 void RaftNode::advanceCommitIndex() {
-    for (int n = static_cast<int>(log.size()) - 1; n > commitIndex; n--) {
-        if (log[n].term != currentTerm) continue;
+    for (int n = lastLogIndex(); n > commitIndex; n--) {
+        if (logAt(n).term != currentTerm) continue;
 
         int count = 1;
         for (const auto& node : config.nodes) {
@@ -400,10 +445,263 @@ void RaftNode::advanceCommitIndex() {
 void RaftNode::applyCommitted() {
     while (lastApplied < commitIndex) {
         lastApplied++;
-        kvStore.apply(log[lastApplied]);
+        const LogEntry& e = logAt(lastApplied);
+        kvStore.apply(e);
         log_event("Applied log[" + std::to_string(lastApplied) + "]: "
-                  + log[lastApplied].key + "=" + std::to_string(log[lastApplied].value));
+                  + std::string(1, e.key) + "=" + std::to_string(e.value));
     }
+    // trigger snapshot when log has grown too large
+    if (static_cast<int>(log.size()) > SNAPSHOT_LOG_THRESHOLD) {
+        takeSnapshot();
+    }
+}
+
+// serialize KV store to "A=1;B=2;" format (no pipes — safe inside message fields)
+std::string RaftNode::serializeKVStore() const {
+    std::ostringstream oss;
+    for (const auto& [k, v] : kvStore.getAll()) {
+        oss << k << "=" << v << ";";
+    }
+    return oss.str();
+}
+
+// deserialize KV store from "A=1;B=2;" format into kvStore
+void RaftNode::deserializeKVStore(const std::string& data) {
+    std::istringstream iss(data);
+    std::string pair;
+    while (std::getline(iss, pair, ';')) {
+        if (pair.empty()) continue;
+        auto eq = pair.find('=');
+        if (eq == std::string::npos) continue;
+        LogEntry e;
+        e.key   = pair[0];
+        e.value = std::stoi(pair.substr(eq + 1));
+        e.index = 0;
+        e.term  = 0;
+        kvStore.apply(e);
+    }
+}
+
+// take a snapshot at lastApplied: compact log and save to disk
+void RaftNode::takeSnapshot() {
+    if (lastApplied <= lastIncludedIndex) return;
+
+    int newLII = lastApplied;
+    int newLIT = logAt(newLII).term;
+    int lli    = lastLogIndex();
+
+    // build new log: sentinel at newLII + any uncommitted tail entries
+    std::vector<LogEntry> newLog;
+    newLog.push_back({newLII, newLIT, '\0', 0});
+    for (int i = newLII + 1; i <= lli; i++) {
+        newLog.push_back(logAt(i));
+    }
+
+    int oldSize = static_cast<int>(log.size());
+    lastIncludedIndex = newLII;
+    lastIncludedTerm  = newLIT;
+    log = std::move(newLog);
+
+    saveSnapshotToFile();
+    savePersistentState();  // update persistent log to reflect compaction
+    log_event("Snapshot taken at index=" + std::to_string(lastIncludedIndex)
+              + " log shrunk from " + std::to_string(oldSize)
+              + " to " + std::to_string((int)log.size()) + " entries");
+}
+
+// save persistent Raft state (currentTerm, votedFor, log[]) to raft_state_<nodeId>.dat
+// Full rewrite — used when term/vote changes, log is truncated, or snapshot is taken.
+void RaftNode::savePersistentState() const {
+    std::string path = "raft_state_" + std::to_string(nodeId) + ".dat";
+    std::ofstream f(path);
+    if (!f.is_open()) return;
+    f << "currentTerm=" << currentTerm << "\n";
+    f << "votedFor="    << votedFor    << "\n";
+    // write log entries starting from index 1 (skip the sentinel at 0)
+    for (size_t i = 1; i < log.size(); i++) {
+        const LogEntry& e = log[i];
+        f << "log:" << e.index << "," << e.term << "," << e.key << "," << e.value << "\n";
+    }
+}
+
+// append a single log entry to the persistent state file (O(1) — no full rewrite)
+void RaftNode::appendLogEntryToDisk(const LogEntry& e) const {
+    std::string path = "raft_state_" + std::to_string(nodeId) + ".dat";
+    std::ofstream f(path, std::ios::app);
+    if (!f.is_open()) return;
+    f << "log:" << e.index << "," << e.term << "," << e.key << "," << e.value << "\n";
+}
+
+// load persistent Raft state from raft_state_<nodeId>.dat; returns true if loaded
+bool RaftNode::loadPersistentState() {
+    std::string path = "raft_state_" + std::to_string(nodeId) + ".dat";
+    std::ifstream f(path);
+    if (!f.is_open()) return false;
+
+    bool loaded = false;
+    std::string line;
+    while (std::getline(f, line)) {
+        if (line.rfind("currentTerm=", 0) == 0) {
+            currentTerm = std::stoi(line.substr(12));
+            loaded = true;
+        } else if (line.rfind("votedFor=", 0) == 0) {
+            votedFor = std::stoi(line.substr(9));
+        } else if (line.rfind("log:", 0) == 0) {
+            // format: log:index,term,key,value
+            std::string s = line.substr(4);
+            LogEntry e;
+            size_t p0 = 0, p1;
+            p1 = s.find(',', p0); e.index = std::stoi(s.substr(p0, p1 - p0)); p0 = p1 + 1;
+            p1 = s.find(',', p0); e.term  = std::stoi(s.substr(p0, p1 - p0)); p0 = p1 + 1;
+            p1 = s.find(',', p0); e.key   = s[p0];                             p0 = p1 + 1;
+            e.value = std::stoi(s.substr(p0));
+            // skip entries already covered by the snapshot
+            if (e.index > lastIncludedIndex) {
+                log.push_back(e);
+            }
+        }
+    }
+    return loaded;
+}
+
+// save snapshot to snapshot_<nodeId>.dat
+void RaftNode::saveSnapshotToFile() const {
+    std::string path = "snapshot_" + std::to_string(nodeId) + ".dat";
+    std::ofstream f(path);
+    if (!f.is_open()) return;
+    f << "lastIncludedIndex=" << lastIncludedIndex << "\n";
+    f << "lastIncludedTerm="  << lastIncludedTerm  << "\n";
+    for (const auto& [k, v] : kvStore.getAll()) {
+        f << "kv:" << k << "=" << v << "\n";
+    }
+}
+
+// load snapshot from snapshot_<nodeId>.dat; returns true if loaded
+bool RaftNode::loadSnapshotFromFile() {
+    std::string path = "snapshot_" + std::to_string(nodeId) + ".dat";
+    std::ifstream f(path);
+    if (!f.is_open()) return false;
+
+    int lii = 0, lit = 0;
+    std::string line;
+    while (std::getline(f, line)) {
+        if (line.rfind("lastIncludedIndex=", 0) == 0)
+            lii = std::stoi(line.substr(18));
+        else if (line.rfind("lastIncludedTerm=", 0) == 0)
+            lit = std::stoi(line.substr(17));
+        else if (line.rfind("kv:", 0) == 0) {
+            auto eq = line.find('=', 3);
+            if (eq != std::string::npos) {
+                LogEntry e;
+                e.key   = line[3];
+                e.value = std::stoi(line.substr(eq + 1));
+                e.index = 0;
+                e.term  = 0;
+                kvStore.apply(e);
+            }
+        }
+    }
+
+    if (lii == 0) return false;
+
+    lastIncludedIndex = lii;
+    lastIncludedTerm  = lit;
+    log.clear();
+    log.push_back({lii, lit, '\0', 0});
+    commitIndex = lii;
+    lastApplied = lii;
+    return true;
+}
+
+// handle InstallSnapshot RPC from leader
+Message RaftNode::handleInstallSnapshot(const Message& msg) {
+    Message reply;
+    reply.type     = MessageType::InstallSnapshotReply;
+    reply.senderId = nodeId;
+    reply.term     = currentTerm;
+
+    if (msg.term < currentTerm) return reply;
+
+    if (msg.term > currentTerm || role != Role::Follower) {
+        becomeFollower(msg.term);
+    }
+    leaderId = msg.leaderId;
+    electionTimer.reset();
+
+    // already have this snapshot or a newer one
+    if (msg.lastIncludedIndex <= lastIncludedIndex) {
+        reply.term = currentTerm;
+        return reply;
+    }
+
+    // install snapshot: restore state machine from snapshot data
+    kvStore = StateMachine{};
+    deserializeKVStore(msg.snapshotData);
+
+    lastIncludedIndex = msg.lastIncludedIndex;
+    lastIncludedTerm  = msg.lastIncludedTerm;
+
+    // discard entire log; keep only sentinel at snapshot point
+    log.clear();
+    log.push_back({lastIncludedIndex, lastIncludedTerm, '\0', 0});
+
+    if (commitIndex < lastIncludedIndex) commitIndex = lastIncludedIndex;
+    if (lastApplied < lastIncludedIndex) lastApplied = lastIncludedIndex;
+
+    saveSnapshotToFile();
+    savePersistentState();  // update persistent log to reflect installed snapshot
+    reply.term = currentTerm;
+    log_event("Installed snapshot at index=" + std::to_string(lastIncludedIndex));
+    return reply;
+}
+
+// handle InstallSnapshotReply from a follower
+Message RaftNode::handleInstallSnapshotReply(const Message& msg) {
+    if (role != Role::Leader) return {};
+    if (msg.term > currentTerm) {
+        becomeFollower(msg.term);
+        return {};
+    }
+    int peerId = msg.senderId;
+    // follower is now caught up to at least lastIncludedIndex
+    if (nextIndex[peerId] <= lastIncludedIndex) {
+        nextIndex[peerId]  = lastIncludedIndex + 1;
+        matchIndex[peerId] = lastIncludedIndex;
+    }
+    recentAckPeers.insert(peerId);
+    checkMajorityAck();
+    log_event("Node " + std::to_string(peerId)
+              + " installed snapshot up to index=" + std::to_string(matchIndex[peerId]));
+    return {};
+}
+
+// send a snapshot to a lagging follower
+void RaftNode::sendInstallSnapshotToPeer(int peerId) {
+    if (role != Role::Leader) return;
+
+    int  lii  = lastIncludedIndex;
+    int  lit  = lastIncludedTerm;
+    int  term = currentTerm;
+    int  lid  = nodeId;
+    std::string data = serializeKVStore();
+    const auto& peerConfig = config.getNode(peerId);
+
+    std::thread([this, peerConfig, term, lid, lii, lit, data, peerId]() {
+        Message req;
+        req.type              = MessageType::InstallSnapshot;
+        req.term              = term;
+        req.senderId          = lid;
+        req.leaderId          = lid;
+        req.lastIncludedIndex = lii;
+        req.lastIncludedTerm  = lit;
+        req.snapshotData      = data;
+
+        Message reply;
+        if (sendRPC(peerConfig.hostname, peerConfig.port, req, reply)) {
+            reply.senderId = peerId;
+            eventQueue.push(Event{Event::IncomingRPC, reply, peerId});
+        }
+    }).detach();
 }
 
 // handle client put
@@ -424,11 +722,12 @@ Message RaftNode::handleClientPut(const Message& msg) {
     }
 
     LogEntry entry;
-    entry.index = static_cast<int>(log.size());
+    entry.index = lastLogIndex() + 1;
     entry.term = currentTerm;
     entry.key = msg.key;
     entry.value = msg.value;
     log.push_back(entry);
+    appendLogEntryToDisk(entry);  // O(1) append; no full rewrite needed
 
     log_event("Client PUT: " + std::string(1, msg.key) + "="
               + std::to_string(msg.value) + " at index " + std::to_string(entry.index));
@@ -481,6 +780,19 @@ void RaftNode::run() {
     running = true;
     const auto& self = config.getNode(nodeId);
 
+    // restore from snapshot first (establishes lastIncludedIndex baseline)
+    if (loadSnapshotFromFile()) {
+        log_event("Restored from snapshot at index=" + std::to_string(lastIncludedIndex));
+    }
+
+    // then restore persistent state (currentTerm, votedFor, and log entries
+    // AFTER the snapshot; entries at or before lastIncludedIndex are skipped)
+    if (loadPersistentState()) {
+        log_event("Restored persistent state: term=" + std::to_string(currentTerm)
+                  + " votedFor=" + std::to_string(votedFor)
+                  + " logSize=" + std::to_string(log.size()));
+    }
+
     // start the server
     server.start(self.port, [this](const Message& request) -> Message {
         std::lock_guard<std::mutex> lock(raftMtx);
@@ -495,6 +807,8 @@ void RaftNode::run() {
                 return handleClientPut(request);
             case MessageType::ClientGet:
                 return handleClientGet(request);
+            case MessageType::InstallSnapshot:
+                return handleInstallSnapshot(request);
             default:
                 return {};
         }
@@ -536,6 +850,9 @@ void RaftNode::run() {
                         break;
                     case MessageType::AppendEntriesReply:
                         handleAppendEntriesReply(event.msg, event.lastSentIndex);
+                        break;
+                    case MessageType::InstallSnapshotReply:
+                        handleInstallSnapshotReply(event.msg);
                         break;
                     default:
                         break;

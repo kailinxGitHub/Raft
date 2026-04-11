@@ -13,7 +13,9 @@ enum class MessageType {
     AppendEntriesReply,
     ClientPut,
     ClientGet,
-    ClientResponse
+    ClientResponse,
+    InstallSnapshot,
+    InstallSnapshotReply
 };
 
 // message struct
@@ -33,6 +35,11 @@ struct Message {
     int prevLogTerm = 0;
     int leaderCommit = 0;
     std::vector<LogEntry> entries;
+
+    // snapshot fields (InstallSnapshot RPC)
+    int lastIncludedIndex = 0;
+    int lastIncludedTerm  = 0;
+    std::string snapshotData; // serialized KV store: "A=1;B=2;" (no pipes)
 
     // reply fields
     bool voteGranted = false;

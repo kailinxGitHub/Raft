@@ -16,9 +16,11 @@ static std::string messageTypeToString(MessageType t) {
         case MessageType::RequestVoteReply:   return "RequestVoteReply";
         case MessageType::AppendEntries:      return "AppendEntries";
         case MessageType::AppendEntriesReply: return "AppendEntriesReply";
-        case MessageType::ClientPut:          return "ClientPut";
-        case MessageType::ClientGet:          return "ClientGet";
-        case MessageType::ClientResponse:     return "ClientResponse";
+        case MessageType::ClientPut:             return "ClientPut";
+        case MessageType::ClientGet:             return "ClientGet";
+        case MessageType::ClientResponse:        return "ClientResponse";
+        case MessageType::InstallSnapshot:       return "InstallSnapshot";
+        case MessageType::InstallSnapshotReply:  return "InstallSnapshotReply";
     }
     return "Unknown";
 }
@@ -29,9 +31,11 @@ static MessageType stringToMessageType(const std::string& s) {
     if (s == "RequestVoteReply")   return MessageType::RequestVoteReply;
     if (s == "AppendEntries")      return MessageType::AppendEntries;
     if (s == "AppendEntriesReply") return MessageType::AppendEntriesReply;
-    if (s == "ClientPut")          return MessageType::ClientPut;
-    if (s == "ClientGet")          return MessageType::ClientGet;
-    if (s == "ClientResponse")     return MessageType::ClientResponse;
+    if (s == "ClientPut")             return MessageType::ClientPut;
+    if (s == "ClientGet")             return MessageType::ClientGet;
+    if (s == "ClientResponse")        return MessageType::ClientResponse;
+    if (s == "InstallSnapshot")       return MessageType::InstallSnapshot;
+    if (s == "InstallSnapshotReply")  return MessageType::InstallSnapshotReply;
     throw std::runtime_error("Unknown message type: " + s);
 }
 
@@ -105,6 +109,15 @@ std::string serialize(const Message& msg) {
                 << "|redirectHost=" << msg.redirectHost
                 << "|redirectPort=" << msg.redirectPort;
             break;
+        case MessageType::InstallSnapshot:
+            oss << "|leaderId=" << msg.leaderId
+                << "|lastIncludedIndex=" << msg.lastIncludedIndex
+                << "|lastIncludedTerm=" << msg.lastIncludedTerm
+                << "|snapshotData=" << msg.snapshotData;
+            break;
+        case MessageType::InstallSnapshotReply:
+            // only term and senderId (already written above)
+            break;
     }
     return oss.str();
 }
@@ -138,8 +151,11 @@ Message deserialize(const std::string& line) {
         else if (key == "key")          msg.key = val.empty() ? '\0' : val[0];
         else if (key == "value")        msg.value = std::stoi(val);
         else if (key == "isLeader")     msg.isLeader = (val == "true");
-        else if (key == "redirectHost") msg.redirectHost = val;
-        else if (key == "redirectPort") msg.redirectPort = std::stoi(val);
+        else if (key == "redirectHost")      msg.redirectHost = val;
+        else if (key == "redirectPort")      msg.redirectPort = std::stoi(val);
+        else if (key == "lastIncludedIndex") msg.lastIncludedIndex = std::stoi(val);
+        else if (key == "lastIncludedTerm")  msg.lastIncludedTerm  = std::stoi(val);
+        else if (key == "snapshotData")      msg.snapshotData = val;
     }
 
     if (!entriesStr.empty()) {
