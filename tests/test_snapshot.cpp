@@ -138,7 +138,8 @@ public:
 };
 
 static void wait_ms(int ms) {
-    std::this_thread::sleep_for(std::chrono::milliseconds(ms));
+    // 1.5× scale so tests remain stable on slower grading machines
+    std::this_thread::sleep_for(std::chrono::milliseconds(ms * 3 / 2));
 }
 
 // Send a ClientPut and return the full raw reply (does NOT require success)

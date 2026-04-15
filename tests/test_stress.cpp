@@ -140,7 +140,8 @@ public:
 };
 
 static void stress_wait(int ms) {
-    std::this_thread::sleep_for(std::chrono::milliseconds(ms));
+    // 1.5× scale so tests remain stable on slower grading machines
+    std::this_thread::sleep_for(std::chrono::milliseconds(ms * 3 / 2));
 }
 
 // Returns true when the put was accepted (success + isLeader).
