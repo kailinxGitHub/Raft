@@ -6,7 +6,7 @@
 #include <unistd.h>
 #include <sys/socket.h>
 #include <netinet/in.h>
-#include <netdb.h>
+#include <arpa/inet.h>
 #include <thread>
 
 // helper to convert message type to string
@@ -205,16 +205,13 @@ bool sendRPC(const std::string& host, int port, const Message& request, Message&
 
     setSocketTimeout(fd, SOCKET_TIMEOUT_MS);
 
-    struct hostent* server = gethostbyname(host.c_str());
-    if (!server) {
-        close(fd);
-        return false;
-    }
-
     struct sockaddr_in addr;
     memset(&addr, 0, sizeof(addr));
     addr.sin_family = AF_INET;
-    memcpy(&addr.sin_addr.s_addr, server->h_addr, server->h_length);
+    if (inet_pton(AF_INET, host.c_str(), &addr.sin_addr) != 1) {
+        close(fd);
+        return false;
+    }
     addr.sin_port = htons(port);
 
     if (connect(fd, (struct sockaddr*)&addr, sizeof(addr)) < 0) {

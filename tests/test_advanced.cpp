@@ -63,12 +63,12 @@ public:
             _exit(1);
         }
         nodes.push_back({nodeId, pid, logFile});
+        ::usleep(10 * 1000); // 10 ms stagger: breaks lockstep timers on Linux
     }
 
     void startAll(int count, int fixedTimeout = 0) {
         for (int i = 0; i < count; i++) {
             startNode(i, fixedTimeout);
-            if (i < count - 1) ::usleep(10 * 1000);
         }
     }
 
@@ -120,6 +120,12 @@ public:
         int bestNode = -1;
         int bestTerm = -1;
         for (int i = 0; i < nodeCount; i++) {
+            // Skip nodes that have been killed
+            bool alive = false;
+            for (const auto& n : nodes) {
+                if (n.nodeId == i && n.pid > 0) { alive = true; break; }
+            }
+            if (!alive) continue;
             std::string log = readLog(i);
             size_t pos = log.rfind("Became Leader for term ");
             if (pos != std::string::npos) {
@@ -137,6 +143,12 @@ public:
         int bestNode = -1;
         int bestTerm = -1;
         for (int id : liveNodes) {
+            // Skip nodes that have been killed
+            bool alive = false;
+            for (const auto& n : nodes) {
+                if (n.nodeId == id && n.pid > 0) { alive = true; break; }
+            }
+            if (!alive) continue;
             std::string log = readLog(id);
             size_t pos = log.rfind("Became Leader for term ");
             if (pos != std::string::npos) {
@@ -165,25 +177,32 @@ static void wait_ms(int ms) {
     std::this_thread::sleep_for(std::chrono::milliseconds(ms * 2));
 }
 
-static bool sendPut(const std::string& host, int port, char key, int value) {
+// outLeaderNode: when non-null and the put succeeds, set to reply.senderId (leader node id).
+// Needed when the initial port is a follower that redirects — the leader id is not the probe index.
+static bool sendPut(const std::string& host, int port, char key, int value,
+                    int* outLeaderNode = nullptr) {
     Message req;
     req.type = MessageType::ClientPut;
     req.senderId = -1;
     req.key = key;
     req.value = value;
     int targetPort = port;
-    for (int failCount = 0; failCount < 6; ) {
+    for (int attempt = 0; attempt < 20; ) {
         Message reply;
         if (sendRPC(host, targetPort, req, reply)) {
-            if (reply.success && reply.isLeader) return true;
-            if (!reply.isLeader && reply.leaderId >= 0 &&
-                9000 + reply.leaderId != targetPort) {
-                targetPort = 9000 + reply.leaderId;
+            if (reply.success && reply.isLeader) {
+                if (outLeaderNode) *outLeaderNode = reply.senderId;
+                return true;
+            }
+            if (!reply.isLeader && reply.redirectPort > 0 &&
+                reply.redirectPort != targetPort) {
+                targetPort = reply.redirectPort;
                 continue;
             }
         }
-        ++failCount;
-        std::this_thread::sleep_for(std::chrono::milliseconds(300));
+        ++attempt;
+        targetPort = 9000 + (attempt % 5);
+        std::this_thread::sleep_for(std::chrono::milliseconds(200));
     }
     return false;
 }
@@ -228,11 +247,15 @@ void test_data_survives_three_leader_changes() {
     c.killNode(leader1);
     wait_ms(3000);
 
-    // Find leader 2 by probing: the node that accepts the write is the current leader
+    // Find leader 2 by probing: follow redirects and record the actual leader from the reply.
     int leader2 = -1;
     for (int i = 0; i < 5; i++) {
         if (i == leader1) continue;
-        if (sendPut("127.0.0.1", 9000 + i, 'b', 20)) { leader2 = i; break; }
+        int actualLeader = -1;
+        if (sendPut("127.0.0.1", 9000 + i, 'b', 20, &actualLeader)) {
+            leader2 = actualLeader;
+            break;
+        }
     }
     ASSERT_GE(leader2, 0);
     wait_ms(1000);
@@ -249,7 +272,11 @@ void test_data_survives_three_leader_changes() {
     int leader3 = -1;
     for (int i = 0; i < 5; i++) {
         if (i == leader1 || i == leader2) continue;
-        if (sendPut("127.0.0.1", 9000 + i, 'c', 30)) { leader3 = i; break; }
+        int actualLeader = -1;
+        if (sendPut("127.0.0.1", 9000 + i, 'c', 30, &actualLeader)) {
+            leader3 = actualLeader;
+            break;
+        }
     }
     ASSERT_GE(leader3, 0);
     wait_ms(1000);

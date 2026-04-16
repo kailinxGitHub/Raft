@@ -72,12 +72,12 @@ public:
             _exit(1);
         }
         nodes.push_back({nodeId, pid, logFile});
+        ::usleep(10 * 1000); // 10 ms stagger: breaks lockstep timers on Linux
     }
 
     void startAll(int count, int fixedTimeout = 0) {
         for (int i = 0; i < count; i++) {
             startNode(i, fixedTimeout);
-            if (i < count - 1) ::usleep(10 * 1000);
         }
     }
 
@@ -136,6 +136,12 @@ public:
         int bestNode = -1;
         int bestTerm = -1;
         for (int i = 0; i < nodeCount; i++) {
+            // Skip nodes that have been killed
+            bool alive = false;
+            for (const auto& n : nodes) {
+                if (n.nodeId == i && n.pid > 0) { alive = true; break; }
+            }
+            if (!alive) continue;
             std::string log = readLog(i);
             size_t pos = log.rfind("Became Leader for term ");
             if (pos != std::string::npos) {
@@ -176,7 +182,8 @@ static Message sendPutRaw(const std::string& host, int port, char key, int value
     return reply;
 }
 
-// Send a ClientPut to a leader; follows redirects and retries on failure
+// Send a ClientPut to a leader; follows redirects and retries on failure.
+// When a redirect is unavailable, rotates through all cluster ports.
 static bool sendPut(const std::string& host, int port, char key, int value) {
     Message req;
     req.type     = MessageType::ClientPut;
@@ -184,18 +191,19 @@ static bool sendPut(const std::string& host, int port, char key, int value) {
     req.key      = key;
     req.value    = value;
     int targetPort = port;
-    for (int failCount = 0; failCount < 6; ) {
+    for (int attempt = 0; attempt < 20; ) {
         Message reply;
         if (sendRPC(host, targetPort, req, reply)) {
             if (reply.success && reply.isLeader) return true;
-            if (!reply.isLeader && reply.leaderId >= 0 &&
-                9000 + reply.leaderId != targetPort) {
-                targetPort = 9000 + reply.leaderId;
+            if (!reply.isLeader && reply.redirectPort > 0 &&
+                reply.redirectPort != targetPort) {
+                targetPort = reply.redirectPort;
                 continue;
             }
         }
-        ++failCount;
-        std::this_thread::sleep_for(std::chrono::milliseconds(300));
+        ++attempt;
+        targetPort = 9000 + (attempt % 5);
+        std::this_thread::sleep_for(std::chrono::milliseconds(200));
     }
     return false;
 }

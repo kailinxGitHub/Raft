@@ -12,11 +12,13 @@ void Timer::start(std::function<int()> intervalFunc, std::function<void()> cb) {
         while (running) {
             int ms = intervalFn();
             std::unique_lock<std::mutex> lock(mtx);
-            resetFlag = false;
             cv.wait_for(lock, std::chrono::milliseconds(ms),
                 [this]() { return stopped.load() || resetFlag; });
             if (stopped) break;
-            if (resetFlag) continue;
+            if (resetFlag) {
+                resetFlag = false;
+                continue;
+            }
             if (running) {
                 callback();
             }

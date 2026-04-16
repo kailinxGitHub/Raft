@@ -73,12 +73,12 @@ public:
             _exit(1);
         }
         nodes.push_back({nodeId, pid, logFile});
+        ::usleep(10 * 1000); // 10 ms stagger: breaks lockstep timers on Linux
     }
 
     void startAll(int count, int fixedTimeout = 0) {
         for (int i = 0; i < count; i++) {
             startNode(i, fixedTimeout);
-            if (i < count - 1) ::usleep(10 * 1000);
         }
     }
 
@@ -126,11 +126,17 @@ public:
         return count;
     }
 
-    // Returns the highest-term leader among [0, nodeCount) — most recently elected.
+    // Returns the highest-term leader among alive nodes in [0, nodeCount).
     int findLeader(int nodeCount) const {
         int bestNode = -1;
         int bestTerm = -1;
         for (int i = 0; i < nodeCount; i++) {
+            // Skip nodes that have been killed
+            bool alive = false;
+            for (const auto& n : nodes) {
+                if (n.nodeId == i && n.pid > 0) { alive = true; break; }
+            }
+            if (!alive) continue;
             std::string log = readLog(i);
             size_t pos = log.rfind("Became Leader for term ");
             if (pos != std::string::npos) {
@@ -143,11 +149,17 @@ public:
         return bestNode;
     }
 
-    // Returns the highest-term leader among `candidates`.
+    // Returns the highest-term leader among alive `candidates`.
     int findLeaderAmong(const std::vector<int>& candidates) const {
         int bestNode = -1;
         int bestTerm = -1;
         for (int id : candidates) {
+            // Skip nodes that have been killed
+            bool alive = false;
+            for (const auto& n : nodes) {
+                if (n.nodeId == id && n.pid > 0) { alive = true; break; }
+            }
+            if (!alive) continue;
             std::string log = readLog(id);
             size_t pos = log.rfind("Became Leader for term ");
             if (pos != std::string::npos) {
@@ -178,6 +190,8 @@ static void stress_wait(int ms) {
 
 // Returns true when the put was accepted (success + isLeader).
 // Follows leader redirects and retries on transient failures.
+// When a redirect is unavailable (stale self-redirect or unknown leader),
+// rotates through all 5 cluster ports to find the live leader.
 static bool stressPut(const std::string& host, int port, char key, int value) {
     Message req;
     req.type     = MessageType::ClientPut;
@@ -185,18 +199,19 @@ static bool stressPut(const std::string& host, int port, char key, int value) {
     req.key      = key;
     req.value    = value;
     int targetPort = port;
-    for (int failCount = 0; failCount < 6; ) {
+    for (int attempt = 0; attempt < 20; ) {
         Message reply;
         if (sendRPC(host, targetPort, req, reply)) {
             if (reply.success && reply.isLeader) return true;
-            if (!reply.isLeader && reply.leaderId >= 0 &&
-                9000 + reply.leaderId != targetPort) {
-                targetPort = 9000 + reply.leaderId;
+            if (!reply.isLeader && reply.redirectPort > 0 &&
+                reply.redirectPort != targetPort) {
+                targetPort = reply.redirectPort;
                 continue;
             }
         }
-        ++failCount;
-        std::this_thread::sleep_for(std::chrono::milliseconds(300));
+        ++attempt;
+        targetPort = 9000 + (attempt % 5);
+        std::this_thread::sleep_for(std::chrono::milliseconds(200));
     }
     return false;
 }
@@ -278,6 +293,7 @@ void test_rapid_leader_churn_under_writes() {
             leader = c.findLeaderAmong(liveNodes);
         }
         if (leader < 0) break;
+        fprintf(stderr, "[DBG churn] round=%d leader=%d\n", round, leader);
 
         // Write 5 entries
         for (int w = 0; w < 5; w++) {

@@ -57,12 +57,12 @@ public:
             _exit(1);
         }
         nodes.push_back({nodeId, pid});
+        ::usleep(10 * 1000); // 10 ms stagger: breaks lockstep timers on Linux
     }
 
     void startAll(int count, int ft = 0) {
         for (int i = 0; i < count; i++) {
             startNode(i, ft);
-            if (i < count - 1) ::usleep(10 * 1000);
         }
     }
 
@@ -113,6 +113,12 @@ public:
         int bestNode = -1;
         int bestTerm = -1;
         for (int i = 0; i < count; i++) {
+            // Skip nodes that have been killed
+            bool alive = false;
+            for (const auto& n : nodes) {
+                if (n.id == i && n.pid > 0) { alive = true; break; }
+            }
+            if (!alive) continue;
             std::string log = readLog(i);
             size_t pos = log.rfind("Became Leader for term ");
             if (pos != std::string::npos) {
@@ -148,18 +154,19 @@ static bool sendPut(int port, char key, int value) {
     req.key = key;
     req.value = value;
     int targetPort = port;
-    for (int failCount = 0; failCount < 6; ) {
+    for (int attempt = 0; attempt < 20; ) {
         Message reply;
         if (sendRPC("127.0.0.1", targetPort, req, reply)) {
             if (reply.success && reply.isLeader) return true;
-            if (!reply.isLeader && reply.leaderId >= 0 &&
-                9000 + reply.leaderId != targetPort) {
-                targetPort = 9000 + reply.leaderId;
+            if (!reply.isLeader && reply.redirectPort > 0 &&
+                reply.redirectPort != targetPort) {
+                targetPort = reply.redirectPort;
                 continue;
             }
         }
-        ++failCount;
-        std::this_thread::sleep_for(std::chrono::milliseconds(300));
+        ++attempt;
+        targetPort = 9000 + (attempt % 5);
+        std::this_thread::sleep_for(std::chrono::milliseconds(200));
     }
     return false;
 }

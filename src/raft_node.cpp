@@ -85,9 +85,20 @@ void RaftNode::becomeFollower(int term) {
         savePersistentState();
     }
 
-    // stop heartbeat and election timers
+    // stop heartbeat timer
     heartbeatTimer.stop();
-    electionTimer.reset();
+
+    if (oldRole == Role::Leader) {
+        electionTimer.stop();
+        electionTimer.start(
+            [this]() {
+                return fixedTimeoutMs > 0 ? fixedTimeoutMs : randomElectionTimeout();
+            },
+            [this]() { eventQueue.push(Event{Event::ElectionTimeout, {}, -1}); }
+        );
+    } else {
+        electionTimer.reset();
+    }
     if (oldRole != Role::Follower) {
         log_event("Stepped down to Follower");
     }
@@ -100,10 +111,6 @@ void RaftNode::startElection() {
     votedFor = nodeId;
     votesReceived = 1;
     electionTerm = currentTerm;
-    // Note: we do NOT persist here. A self-vote in a failed candidacy must not
-    // survive a crash — doing so causes stale high-term disruption on restart.
-    // We persist when granting a vote to someone else (handleRequestVote) or
-    // when our term advances due to a higher-term message (becomeFollower).
     electionTimer.reset();
 
     log_event("Starting election for term " + std::to_string(currentTerm));
@@ -436,6 +443,8 @@ void RaftNode::advanceCommitIndex() {
             log_event("Advanced commitIndex from " + std::to_string(commitIndex)
                       + " to " + std::to_string(n));
             commitIndex = n;
+            // Persist updated commit index so committed entries survive crashes.
+            savePersistentState();
             break;
         }
     }
@@ -509,14 +518,14 @@ void RaftNode::takeSnapshot() {
               + " to " + std::to_string((int)log.size()) + " entries");
 }
 
-// save persistent Raft state (currentTerm, votedFor, log[]) to raft_state_<nodeId>.dat
-// Full rewrite — used when term/vote changes, log is truncated, or snapshot is taken.
 void RaftNode::savePersistentState() const {
     std::string path = "raft_state_" + std::to_string(nodeId) + ".dat";
     std::ofstream f(path);
     if (!f.is_open()) return;
     f << "currentTerm=" << currentTerm << "\n";
     f << "votedFor="    << votedFor    << "\n";
+    f << "commitIndex=" << commitIndex << "\n";
+    f << "lastApplied=" << lastApplied << "\n";
     // write log entries starting from index 1 (skip the sentinel at 0)
     for (size_t i = 1; i < log.size(); i++) {
         const LogEntry& e = log[i];
@@ -539,6 +548,8 @@ bool RaftNode::loadPersistentState() {
     if (!f.is_open()) return false;
 
     bool loaded = false;
+    bool sawCommitIndex = false;
+    bool sawLastApplied = false;
     std::string line;
     while (std::getline(f, line)) {
         if (line.rfind("currentTerm=", 0) == 0) {
@@ -546,6 +557,12 @@ bool RaftNode::loadPersistentState() {
             loaded = true;
         } else if (line.rfind("votedFor=", 0) == 0) {
             votedFor = std::stoi(line.substr(9));
+        } else if (line.rfind("commitIndex=", 0) == 0) {
+            commitIndex = std::stoi(line.substr(12));
+            sawCommitIndex = true;
+        } else if (line.rfind("lastApplied=", 0) == 0) {
+            lastApplied = std::stoi(line.substr(12));
+            sawLastApplied = true;
         } else if (line.rfind("log:", 0) == 0) {
             // format: log:index,term,key,value
             std::string s = line.substr(4);
@@ -561,6 +578,20 @@ bool RaftNode::loadPersistentState() {
             }
         }
     }
+
+    // if older state file lacked commitIndex/lastApplied
+    if (!sawCommitIndex) {
+        commitIndex = std::max(commitIndex, lastIncludedIndex);
+        if (lastLogIndex() > commitIndex) {
+            commitIndex = lastLogIndex();
+        }
+    }
+    if (!sawLastApplied) {
+        lastApplied = std::min(std::max(lastApplied, lastIncludedIndex), commitIndex);
+    } else if (lastApplied > commitIndex) {
+        lastApplied = commitIndex;
+    }
+
     return loaded;
 }
 
@@ -727,7 +758,7 @@ Message RaftNode::handleClientPut(const Message& msg) {
     entry.key = msg.key;
     entry.value = msg.value;
     log.push_back(entry);
-    appendLogEntryToDisk(entry);  // O(1) append; no full rewrite needed
+    appendLogEntryToDisk(entry); 
 
     log_event("Client PUT: " + std::string(1, msg.key) + "="
               + std::to_string(msg.value) + " at index " + std::to_string(entry.index));
@@ -761,7 +792,6 @@ Message RaftNode::handleClientGet(const Message& msg) {
     long long staleness = now - lastMajorityAckMs;
 
     if (lastMajorityAckMs == 0 || staleness > HEARTBEAT_INTERVAL_MS * 2) {
-        // Trigger a heartbeat round and tell client to retry
         sendHeartbeats();
         log_event("Client GET: leadership not confirmed, sending heartbeat");
         reply.success = false;
@@ -780,17 +810,20 @@ void RaftNode::run() {
     running = true;
     const auto& self = config.getNode(nodeId);
 
-    // restore from snapshot first (establishes lastIncludedIndex baseline)
     if (loadSnapshotFromFile()) {
         log_event("Restored from snapshot at index=" + std::to_string(lastIncludedIndex));
     }
 
-    // then restore persistent state (currentTerm, votedFor, and log entries
-    // AFTER the snapshot; entries at or before lastIncludedIndex are skipped)
     if (loadPersistentState()) {
         log_event("Restored persistent state: term=" + std::to_string(currentTerm)
                   + " votedFor=" + std::to_string(votedFor)
                   + " logSize=" + std::to_string(log.size()));
+
+        lastApplied = lastIncludedIndex;
+        if (commitIndex < lastApplied) {
+            commitIndex = lastApplied;
+        }
+        applyCommitted();
     }
 
     // start the server
