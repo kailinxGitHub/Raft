@@ -27,7 +27,17 @@ class Cluster {
     std::string confFile;
 
 public:
-    Cluster(const std::string& conf) : confFile(conf) {}
+    Cluster(const std::string& conf) : confFile(conf) {
+        // Pre-cleanup: kill any stale raft_node processes and remove state/log
+        // files from the previous test so this test always starts in a clean state.
+        ::system("pkill -9 -f 'raft_node' 2>/dev/null");
+        ::usleep(150 * 1000);
+        for (int i = 0; i < 5; i++) {
+            ::unlink(("snapshot_"   + std::to_string(i) + ".dat").c_str());
+            ::unlink(("raft_state_" + std::to_string(i) + ".dat").c_str());
+            ::unlink(("test_node_"  + std::to_string(i) + ".log").c_str());
+        }
+    }
 
     void startNode(int nodeId, int fixedTimeout = 0) {
         std::string logFile = "test_node_" + std::to_string(nodeId) + ".log";
@@ -56,7 +66,7 @@ public:
     void killNode(int nodeId) {
         for (auto& n : nodes) {
             if (n.id == nodeId && n.pid > 0) {
-                kill(n.pid, SIGTERM);
+                kill(n.pid, SIGKILL);
                 waitpid(n.pid, nullptr, 0);
                 n.pid = -1;
                 return;
@@ -67,7 +77,7 @@ public:
     void killAll() {
         for (auto& n : nodes) {
             if (n.pid > 0) {
-                kill(n.pid, SIGTERM);
+                kill(n.pid, SIGKILL);
                 waitpid(n.pid, nullptr, 0);
                 n.pid = -1;
             }
@@ -104,13 +114,12 @@ public:
 
     ~Cluster() {
         killAll();
-        // Remove snapshot and persistent state files so they don't bleed into subsequent tests
         for (int i = 0; i < 5; i++) {
-            std::string snap = "snapshot_"   + std::to_string(i) + ".dat";
-            std::string raft = "raft_state_" + std::to_string(i) + ".dat";
-            ::unlink(snap.c_str());
-            ::unlink(raft.c_str());
+            ::unlink(("snapshot_"   + std::to_string(i) + ".dat").c_str());
+            ::unlink(("raft_state_" + std::to_string(i) + ".dat").c_str());
+            ::unlink(("test_node_"  + std::to_string(i) + ".log").c_str());
         }
+        ::usleep(200 * 1000); // let the OS fully release ports before the next test
     }
 };
 

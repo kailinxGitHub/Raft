@@ -42,7 +42,17 @@ class StressCluster {
     std::string confFile;
 
 public:
-    explicit StressCluster(const std::string& conf) : confFile(conf) {}
+    explicit StressCluster(const std::string& conf) : confFile(conf) {
+        // Pre-cleanup: kill any stale raft_node processes and remove state/log
+        // files from the previous test so this test always starts in a clean state.
+        ::system("pkill -9 -f 'raft_node' 2>/dev/null");
+        ::usleep(150 * 1000);
+        for (int i = 0; i < 5; i++) {
+            ::unlink(("snapshot_"   + std::to_string(i) + ".dat").c_str());
+            ::unlink(("raft_state_" + std::to_string(i) + ".dat").c_str());
+            ::unlink(("test_node_"  + std::to_string(i) + ".log").c_str());
+        }
+    }
 
     void startNode(int nodeId, int fixedTimeout = 0) {
         std::string logFile = "test_node_" + std::to_string(nodeId) + ".log";
@@ -72,7 +82,7 @@ public:
     void killNode(int nodeId) {
         for (auto& n : nodes) {
             if (n.nodeId == nodeId && n.pid > 0) {
-                kill(n.pid, SIGTERM);
+                kill(n.pid, SIGKILL);
                 waitpid(n.pid, nullptr, 0);
                 n.pid = -1;
                 return;
@@ -83,7 +93,7 @@ public:
     void killAll() {
         for (auto& n : nodes) {
             if (n.pid > 0) {
-                kill(n.pid, SIGTERM);
+                kill(n.pid, SIGKILL);
                 waitpid(n.pid, nullptr, 0);
                 n.pid = -1;
             }
@@ -135,7 +145,9 @@ public:
         for (int i = 0; i < 5; i++) {
             ::unlink(("snapshot_"   + std::to_string(i) + ".dat").c_str());
             ::unlink(("raft_state_" + std::to_string(i) + ".dat").c_str());
+            ::unlink(("test_node_"  + std::to_string(i) + ".log").c_str());
         }
+        ::usleep(200 * 1000); // let the OS fully release ports before the next test
     }
 };
 
