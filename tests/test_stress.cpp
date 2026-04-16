@@ -76,7 +76,10 @@ public:
     }
 
     void startAll(int count, int fixedTimeout = 0) {
-        for (int i = 0; i < count; i++) startNode(i, fixedTimeout);
+        for (int i = 0; i < count; i++) {
+            startNode(i, fixedTimeout);
+            if (i < count - 1) ::usleep(10 * 1000);
+        }
     }
 
     void killNode(int nodeId) {
@@ -123,21 +126,38 @@ public:
         return count;
     }
 
-    // Returns the first node ID that contains "Became Leader" in its log,
-    // searching among [0, nodeCount).
+    // Returns the highest-term leader among [0, nodeCount) — most recently elected.
     int findLeader(int nodeCount) const {
+        int bestNode = -1;
+        int bestTerm = -1;
         for (int i = 0; i < nodeCount; i++) {
-            if (logContains(i, "Became Leader")) return i;
+            std::string log = readLog(i);
+            size_t pos = log.rfind("Became Leader for term ");
+            if (pos != std::string::npos) {
+                try {
+                    int term = std::stoi(log.substr(pos + 23));
+                    if (term > bestTerm) { bestTerm = term; bestNode = i; }
+                } catch (...) {}
+            }
         }
-        return -1;
+        return bestNode;
     }
 
-    // Returns the first live node in `candidates` that shows "Became Leader".
+    // Returns the highest-term leader among `candidates`.
     int findLeaderAmong(const std::vector<int>& candidates) const {
+        int bestNode = -1;
+        int bestTerm = -1;
         for (int id : candidates) {
-            if (logContains(id, "Became Leader")) return id;
+            std::string log = readLog(id);
+            size_t pos = log.rfind("Became Leader for term ");
+            if (pos != std::string::npos) {
+                try {
+                    int term = std::stoi(log.substr(pos + 23));
+                    if (term > bestTerm) { bestTerm = term; bestNode = id; }
+                } catch (...) {}
+            }
         }
-        return -1;
+        return bestNode;
     }
 
     ~StressCluster() {
@@ -157,15 +177,28 @@ static void stress_wait(int ms) {
 }
 
 // Returns true when the put was accepted (success + isLeader).
+// Follows leader redirects and retries on transient failures.
 static bool stressPut(const std::string& host, int port, char key, int value) {
     Message req;
     req.type     = MessageType::ClientPut;
     req.senderId = -1;
     req.key      = key;
     req.value    = value;
-    Message reply;
-    if (!sendRPC(host, port, req, reply)) return false;
-    return reply.success && reply.isLeader;
+    int targetPort = port;
+    for (int failCount = 0; failCount < 6; ) {
+        Message reply;
+        if (sendRPC(host, targetPort, req, reply)) {
+            if (reply.success && reply.isLeader) return true;
+            if (!reply.isLeader && reply.leaderId >= 0 &&
+                9000 + reply.leaderId != targetPort) {
+                targetPort = 9000 + reply.leaderId;
+                continue;
+            }
+        }
+        ++failCount;
+        std::this_thread::sleep_for(std::chrono::milliseconds(300));
+    }
+    return false;
 }
 
 // Returns the value on success, or a negative sentinel on failure.
