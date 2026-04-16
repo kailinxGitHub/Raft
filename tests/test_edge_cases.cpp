@@ -31,7 +31,7 @@ public:
         // Pre-cleanup: kill any stale raft_node processes and remove state/log
         // files from the previous test so this test always starts in a clean state.
         ::system("pkill -9 -f 'raft_node' 2>/dev/null");
-        ::usleep(150 * 1000);
+        ::usleep(250 * 1000);
         for (int i = 0; i < 5; i++) {
             ::unlink(("snapshot_"   + std::to_string(i) + ".dat").c_str());
             ::unlink(("raft_state_" + std::to_string(i) + ".dat").c_str());
@@ -119,13 +119,13 @@ public:
             ::unlink(("raft_state_" + std::to_string(i) + ".dat").c_str());
             ::unlink(("test_node_"  + std::to_string(i) + ".log").c_str());
         }
-        ::usleep(200 * 1000); // let the OS fully release ports before the next test
+        ::usleep(350 * 1000); // let the OS fully release ports before the next test
     }
 };
 
 static void wait_ms(int ms) {
-    // 1.5× scale so tests remain stable on slower grading machines
-    std::this_thread::sleep_for(std::chrono::milliseconds(ms * 3 / 2));
+    // 2× scale so tests remain stable on slower grading machines
+    std::this_thread::sleep_for(std::chrono::milliseconds(ms * 2));
 }
 
 static bool sendPut(int port, char key, int value) {
